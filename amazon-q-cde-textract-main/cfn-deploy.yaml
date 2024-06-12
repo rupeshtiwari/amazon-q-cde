@@ -1,0 +1,425 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a Amazon Q CDE Lambda function with a Layer, an S3 Bucket, and an IAM Role
+
+Parameters:
+  CDEBucketName:
+    Type: String
+    Default: amazonq-cde-bkt  
+    Description: The name of the S3 bucket to be used by Amazon Q CDE; will be post-fixed with account ID
+  LambdaFunctionName:
+    Type: String
+    Default: pre-extraction-lambda-function-hook
+    Description: The name of the Amazon Q PreExtraction CDE Hook Lambda Function
+  Q4BApplicationID:
+    Type: String
+    Default: <Your Amazon Q Application ID>
+    Description: Your Amazon Q Application ID; Found under "Application settings"
+  Q4BIndexID:
+    Type: String
+    Default: <Your Amazon Q Index ID>
+    Description: Your Amazon Q Index ID; Found under "Retriever settings"
+  Q4BDataSourceID:
+    Type: String
+    Default: <Your Amazon Q Data Source ID>
+    Description: Your Amazon Q Data Source ID; Found in "Data source details"
+
+Resources:  
+  QBusinessCDERole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: QBusiness-CDERole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - qbusiness.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+      ManagedPolicyArns:
+        - !Ref QBusinessCDERolePolicy
+
+  QBusinessCDERolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${CDEBucketName}-${AWS::AccountId}/*'
+              - !Sub 'arn:aws:s3:::${CDEBucketName}-${AWS::AccountId}'
+          - Effect: Allow
+            Action:
+              - 's3:ListBucket'
+            Resource:
+              - !Sub 'arn:aws:s3:::amazonq-cde-bucket-${AWS::AccountId}'
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource:
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunctionName}'
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${CDEBucketName}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - textract:StartDocumentAnalysis
+                  - textract:GetDocumentAnalysis
+                  - textract:AnalyzeDocument
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${CDEBucketName}-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action:
+                  - lambda:PublishLayerVersion
+                  - lambda:AddLayerVersionPermission
+                  - lambda:ListLayerVersions
+                  - lambda:DeleteLayerVersion
+                  - qbusiness:UpdateDataSource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt QBusinessCDERole.Arn
+                Condition: 
+                  StringEquals:
+                    iam:PassedToService: 
+                      - "qbusiness.amazonaws.com"
+  
+  LambdaLayerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CDELambdaLayerCreatorFunction
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      Runtime: python3.12
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import subprocess
+          import json
+          import cfnresponse
+          import shutil
+
+          def lambda_handler(event, context):
+              client = boto3.client('lambda')
+              layer_name = event['ResourceProperties']['LayerName']
+
+              try:
+                  print("Event: ", event)
+                  request_type = event['RequestType']
+                  if request_type == 'Delete':
+                      version_resp = client.list_layer_versions(LayerName=layer_name)
+                      versions = version_resp['LayerVersions']
+                      if versions:
+                        for version in [v['Version'] for v in versions]:
+                            client.delete_layer_version(
+                                LayerName=layer_name,
+                                VersionNumber=version
+                            )
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  layer_dir = '/tmp/python'                  
+                  os.makedirs(layer_dir, exist_ok = True)
+                  print("Creating layer zip with pip...")
+                  subprocess.check_call([
+                      "pip",
+                      "install",
+                      "amazon-textract-textractor[pdf]",
+                      "--target",
+                      layer_dir
+                  ])
+                  
+                  shutil.make_archive('/tmp/layer', 'zip', '/tmp', 'python')
+                  print("Layer zip creation done...")
+                  if request_type == 'Create' or request_type == 'Update':
+                      with open('/tmp/layer.zip', 'rb') as layer_file:
+                        layer_bytes = layer_file.read()
+                      print("Creating Layer version")
+                      response = client.publish_layer_version(
+                          LayerName=layer_name,
+                          Description='Lambda layer containing Amazon Textract Textractor Python library',
+                          Content={'ZipFile': layer_bytes},
+                          CompatibleRuntimes=['python3.12']
+                      )
+                      print(response)
+                      layer_version_arn = response['LayerVersionArn']
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'LayerVersionArn': layer_version_arn})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  LambdaLayerCustomResource:
+    Type: Custom::LambdaLayerCreator
+    Properties:
+      ServiceToken: !GetAtt LambdaLayerFunction.Arn
+      LayerName: TextractorLambdaLayer
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Handler: index.lambda_handler
+      Layers:
+        - !GetAtt LambdaLayerCustomResource.LayerVersionArn
+      Code:
+        ZipFile: !Sub |
+          # document_enrichment_cde.py          
+          import os
+          import json
+          import boto3
+          import logging
+          import mimetypes
+
+          from textractor import Textractor
+          from textractor.data.constants import TextractFeatures
+          from textractor.data.text_linearization_config import TextLinearizationConfig
+
+          os.environ["LD_LIBRARY_PATH"] = f"/opt/python/bin/:{os.environ['LD_LIBRARY_PATH']}"
+          os.environ["PATH"] = f"/opt/python/bin/:{os.environ['PATH']}"
+          region_name = os.environ.get('AWS_REGION')
+          tmp_folder = "/tmp"
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3 = boto3.client('s3')
+          extractor = Textractor(region_name=region_name)
+
+          def download_file_and_get_mime_type(bucket_name, object_key):
+              """
+              Downloads the file into `/tmp` and checks the MIME Type of
+              the file. Supported file types are PNG, JPG, TIF, and PDF
+              """
+              download_path = f'/tmp/{os.path.basename(object_key)}'
+              s3.download_file(Bucket=bucket_name, 
+                              Key=object_key, 
+                              Filename=download_path)    
+              mime_type, _ = mimetypes.guess_type(download_path)    
+              supported_doc = mime_type in ['image/png','image/jpeg','image/tiff','application/pdf']
+              file_extension = os.path.splitext(object_key)[1]
+              return supported_doc, file_extension
+
+
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              s3Bucket = event.get("s3Bucket")
+              s3ObjectKey = event.get("s3ObjectKey")
+              metadata = event.get("metadata")
+              response_object = { "version" : "v0",                                
+                                "s3ObjectKey": s3ObjectKey,
+                                "metadataUpdates": metadata["attributes"]
+                                }
+              try:
+                  """
+                  Check the mime type of the document
+                  """
+                  supported_file, file_type = download_file_and_get_mime_type(bucket_name=s3Bucket, object_key=s3ObjectKey)
+                  s3_uri = f"s3://{s3Bucket}/{s3ObjectKey}"
+                  if supported_file:        
+                      """
+                      This performs an async StartDocumentAnalysis with following features
+                      - LAYOUT
+                      - TABLES
+                      - FORMS (KV Pairs)
+                      - SIGNATURES
+                      """
+                      output = ""
+                      document = extractor.start_document_analysis(
+                          file_source=s3_uri,
+                          save_image=False,
+                          features=[TextractFeatures.LAYOUT, 
+                                  TextractFeatures.TABLES, 
+                                  TextractFeatures.FORMS, 
+                                  TextractFeatures.SIGNATURES]
+                      )
+                  
+                      """
+                      We will leverage the `TextLinearizationConfig` object which has over 40 
+                      options to tailor the text linearization. In this case -
+                      - Titles will be markdown formatted and prefixed with "# "
+                      - Section headers will be markdown formatted and prefixed with "## "
+                      - Tables will be HTML formatted
+                      See https://aws-samples.github.io/amazon-textract-textractor/notebooks/document_linearization_to_markdown_or_html.html#
+                      for more
+                      """
+                      config = TextLinearizationConfig(
+                          hide_figure_layout=False,
+                          title_prefix="# ",
+                          section_header_prefix="## ",
+                          table_prefix="<table>",
+                          table_suffix="</table>",
+                          table_cell_header_prefix = "<th>",
+                          table_cell_header_suffix = "</th>",
+                          table_row_prefix="<tr>",
+                          table_row_suffix="</tr>",
+                          table_cell_prefix="<td>",
+                          table_cell_suffix="</td>",            
+                          hide_page_num_layout=True,
+                      )
+                  
+                      # output = document.get_text(config=config)
+                      for page in document.pages:
+                          output = output + f"============================ Start Page {page.page_num} ============================\n"
+                          output = output + page.get_text(config=config)
+                          output = output + f"============================ End Page {page.page_num} ============================\n\n"
+                      # All text in the text document is extracted and saved in ".txt" format that Amazon Q supports.        
+                      new_key = f"cde_output/layout/{os.path.splitext(os.path.basename(s3ObjectKey))[0]}.txt"
+                      # Each S3 Object is considered a single document. All the .txt files are stored in S3 data-source.
+                      s3.put_object(Bucket=s3Bucket,
+                                    Key=new_key,
+                                    Body=output.encode('utf-8'))
+                      
+                      """
+                      CDE Data contract: https://docs.aws.amazon.com/amazonq/latest/qbusiness-ug/cde-lambda-operations.html#cde-lambda-operations-data-contracts 
+                      Document Attributes: https://docs.aws.amazon.com/amazonq/latest/qbusiness-ug/doc-attributes.html#doc-attribute-types
+                      """
+                      response_object["s3ObjectKey"] = new_key
+                      response_object["metadataUpdates"] = [
+                              {"name":"_source_uri", "value":{"stringValue": s3_uri}},
+                              {"name":"_file_type", "value":{"stringValue": file_type}},
+                              # Need to experiment with _document_body
+                              # {"name":"_document_body", "value":{"stringValue": output.encode('utf-8')}},
+                              # Custom meta data can be used to enhance the search capability in chat see https://docs.aws.amazon.com/amazonq/latest/qbusiness-ug/doc-attributes.html#mapped-doc-attribute-types
+                              # {"name":"custom_key1", "value":{"stringValue": "some_data"}},
+                              # {"name":"custom_key1", "value":{"stringValue": "some_data"}},
+                          ]
+                      logger.info(f"Rresponding to indexer with: {json.dumps(response_object)}")
+                      return response_object
+                  else:
+                      # Textract can't read the document so just return as is
+                      logger.info(f"Document is not a supported file type-PNG, JPG, TIF, PDF")
+                      return response_object
+              except Exception as e:
+                  logger.error(f"Error in enrichment function: {str(e)}")
+                  return response_object
+
+  QCDEFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AmazonQUpdateDataSourceFunction
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Runtime: python3.12
+      Code:
+        ZipFile: |
+          import boto3
+          import os          
+          import cfnresponse          
+
+          def lambda_handler(event, context):
+              client = boto3.client('qbusiness')
+              application_id = event['ResourceProperties']['ApplicationID']
+              data_source_id = event['ResourceProperties']['DataSourceID']
+              index_id = event['ResourceProperties']['IndexID']
+              cde_lambda_arn = event['ResourceProperties']['CDELambdaARN']
+              cde_role_arn = event['ResourceProperties']['CDERoleARN']
+              cde_bucket = event['ResourceProperties']['CDEBucketName']
+              try:
+                  print("Event: ", event)
+                  request_type = event['RequestType']
+                  if request_type == 'Delete':                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  if request_type == 'Create' or request_type == 'Update':
+                      # Update Data Source
+                      print("Updating Amazon Q Business Data Source with CDE")
+                      client.update_data_source(
+                                  applicationId=application_id,
+                                  dataSourceId=data_source_id,
+                                  indexId=index_id,
+                                  documentEnrichmentConfiguration={
+                                    'preExtractionHookConfiguration': {
+                                      'lambdaArn': cde_lambda_arn,
+                                      'roleArn': cde_role_arn,
+                                      's3BucketName': cde_bucket
+                                    }
+                                  }
+                                )
+                      print("Done updating Amazon Q Business Data Source with CDE...")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  QCDECustomResource:
+    Type: Custom::QCDECustomResource
+    Properties:
+      ServiceToken: !GetAtt QCDEFunction.Arn
+      ApplicationID: !Ref Q4BApplicationID
+      DataSourceID: !Ref Q4BDataSourceID
+      IndexID: !Ref Q4BIndexID
+      CDELambdaARN: !GetAtt LambdaFunction.Arn
+      CDERoleARN: !GetAtt QBusinessCDERole.Arn
+      CDEBucketName: !Sub '${CDEBucketName}-${AWS::AccountId}'
+
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt LambdaFunction.Arn
+    Description: The ARN of the Lambda function
+  S3CDEBucketName:
+    Value: !Sub '${CDEBucketName}-${AWS::AccountId}'
+    Description: The name of the S3 bucket
+  CDERoleName:
+    Value: QBusiness-CDERole
+    Description: The name of the Amazon Q CDE IAM Role 
