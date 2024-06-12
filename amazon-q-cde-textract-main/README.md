@@ -122,7 +122,7 @@ Yes. If Amazon Q provides connectors for the third party system then CDE can be 
 
 #### 4. My customer has a collection of MS Word docs, Excel docs, PowePoints, and HTML pages. Will this CDE work on these documents?
 
-This CDE specifically handles scanned documents in PDF, TIF, PNG or JPEG format and uses Amazon Textract as an OCR engine for text extraction. For any other types of files, the CDE will simply pass through the original document to the indexer. If the customer's document is one of the [supported document types](https://docs.aws.amazon.com/amazonq/latest/qbusiness-ug/doc-types.html) then they should get indexed normally by Amazon Q.
+This CDE specifically handles scanned documents in PDF, TIF, PNG or JPEG format and uses Amazon Textract as an OCR engine for text extraction. For any other types of files, the CDE will simply pass through the original document to the indexer.  
 
 #### 5. My customer wants to redact/scrub PII information from the documents before being used by Amazon Q for Business, can this CDE perform PII redaction?
 
@@ -130,11 +130,11 @@ No. However, depending on what PII you want to redact you can customize the Lamb
 
 #### 6. The CDE is deployed correctly and the documents are being extracted and indexed properly, however Amazon Q is either giving incorrect or irrelevant answers.
 
-Follow [this page](https://w.amazon.com/bin/view/AmazonPlato/CustomerIssues) to report inaccurate or irrelevant responses.
+ 
 
 #### 7. I am in a hurry to show a demo with this CDE to my customer, is there a pre-deployed Amazon Q for Business Application I can use?
 
-No. It is recommended that you deploy your own application and create your own data-scource and then deploy the Cloudformation template provided in this repo for demo purposes in your own isengard account. You can follow the steps in [this document](https://quip-amazon.com/vtlzABK2QiNL/How-to-Integrate-Midway-Auth-with-Plato-ExpertQ) to setup authentication with Amazon Midway.
+No. It is recommended that you deploy your own application and create your own data-scource and then deploy the Cloudformation template provided in this repo for demo purposes in your own isengard account. 
 
 #### 8. I deployed the CDE and my data source has documents, but Amazon Q isn't able to answer questions.
 
@@ -142,4 +142,4 @@ Make sure you double check the indexing schedule of your data source. If the ind
 
 #### 9. None of these answer my questions, I want to know if 👉insert_question_here👈
 
-Hop on to the `#amazon-q-business-interest` channel and ask away, don't forget to check-out the pinned resources. You can create a [SpecReq](https://spec-req.sales.aws.a2z.com/create-request) as well.
+Hop on to the `#amazon-q-business-interest` channel and ask away, don't forget to check-out the pinned resources. 
